@@ -10,6 +10,8 @@ SITE_TITLE = "모닝 브리핑"
 # 브리핑에 담을 뉴스 개수 (읽는 피로도 조절의 핵심)
 TOTAL_MAX = 15          # 하루 전체 최대 기사(이슈) 수
 MAX_PER_CATEGORY = 3    # 카테고리당 최대 이슈 수
+MIN_PER_CATEGORY = 1    # 카테고리당 최소 이슈 수 (매일 모든 분야를 훑기 위한 필수 커버리지)
+                        # 주의: MIN_PER_CATEGORY x 카테고리 수 <= TOTAL_MAX 를 유지할 것
 
 # 카카오톡 분할 발송 상한 (카톡 텍스트 200자 제한 때문에 여러 건으로 쪼개 보냄)
 MAX_KAKAO_MESSAGES = 3

@@ -31,7 +31,7 @@ import trafilatura
 from anthropic import Anthropic
 
 from config import (
-    SITE_TITLE, TOTAL_MAX, MAX_PER_CATEGORY, COLLECT_HOURS,
+    SITE_TITLE, TOTAL_MAX, MAX_PER_CATEGORY, MIN_PER_CATEGORY, COLLECT_HOURS,
     CLAUDE_MODEL, CATEGORIES, CATEGORY_HINTS, NAVER_QUERIES,
     MAX_KAKAO_MESSAGES,
 )
@@ -221,7 +221,7 @@ SELECT_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "category": {"type": "string"},
+                    "category": {"type": "string", "enum": list(CATEGORIES)},
                     "headline": {"type": "string"},
                     "article_ids": {"type": "array", "items": {"type": "integer"}},
                     "importance": {"type": "integer"},
@@ -297,6 +297,50 @@ def _call_json(client: Anthropic, prompt: str, schema: dict):
     return json.loads(text)
 
 
+def _pick_balanced(clusters):
+    """카테고리별 최소·최대 개수를 보장하며 최종 이슈를 고른다.
+
+    모델이 프롬프트 규칙을 어기는 경우가 있어(카테고리 상한 초과, 특정 분야 누락)
+    코드에서 한 번 더 강제한다.
+
+    1단계: 모든 카테고리에서 중요도 상위 MIN_PER_CATEGORY개를 먼저 확보한다.
+           분야 커버리지가 목적이므로 이 단계에서는 중요도가 낮아도 채운다.
+    2단계: 남은 자리를 전체 중요도 순으로 채운다 (카테고리당 MAX_PER_CATEGORY 상한).
+    """
+    by_cat = {}
+    for c in clusters:
+        by_cat.setdefault(c.get("category", "기타"), []).append(c)
+    for lst in by_cat.values():
+        lst.sort(key=lambda c: -c.get("importance", 5))
+
+    # config.py의 카테고리 순서를 따르고, 목록에 없는 카테고리는 뒤에 붙인다
+    order = [c for c in CATEGORIES if c in by_cat] +             [c for c in by_cat if c not in CATEGORIES]
+
+    picked, taken, counts = [], set(), {}
+
+    for cat in order:                                    # 1단계: 필수 커버리지
+        for c in by_cat[cat][:MIN_PER_CATEGORY]:
+            picked.append(c)
+            taken.add(id(c))
+            counts[cat] = counts.get(cat, 0) + 1
+
+    for c in sorted(clusters, key=lambda c: -c.get("importance", 5)):   # 2단계
+        if len(picked) >= TOTAL_MAX:
+            break
+        if id(c) in taken:
+            continue
+        cat = c.get("category", "기타")
+        if counts.get(cat, 0) >= MAX_PER_CATEGORY:
+            continue
+        picked.append(c)
+        taken.add(id(c))
+        counts[cat] = counts.get(cat, 0) + 1
+
+    picked.sort(key=lambda c: -c.get("importance", 5))
+    missing = [c for c in CATEGORIES if c not in by_cat]
+    return picked, counts, missing
+
+
 def select_clusters(client: Anthropic, articles, sent_log):
     lines = [f'{a["id"]}|{a["category"]}|{a["source"]}|{a["title"]}' for a in articles]
     hints = "\n".join(f"- {c}: {h}" for c, h in CATEGORY_HINTS.items())
@@ -313,7 +357,7 @@ def select_clusters(client: Anthropic, articles, sent_log):
 ## 선별 규칙 (매우 중요)
 1. 같은 사건을 다룬 기사들은 하나의 '이슈'로 묶는다.
 2. 자잘한 단신, 홍보성 기사, 개별 사건사고, 시황 중계, 연예 가십은 제외한다.
-3. 카테고리당 최대 {MAX_PER_CATEGORY}개 이슈, 전체 최대 {TOTAL_MAX}개 이슈. 뉴스가 빈약한 카테고리는 0~1개만 골라도 된다. 개수를 채우는 것보다 품질이 우선이다.
+3. **모든 카테고리에서 최소 {MIN_PER_CATEGORY}개, 최대 {MAX_PER_CATEGORY}개**를 고른다 (전체 최대 {TOTAL_MAX}개). 독자가 매일 모든 분야를 훑을 수 있어야 하므로, 뉴스가 빈약한 카테고리에서도 그날 가장 나은 이슈를 반드시 1개는 고른다. 대신 그런 이슈에는 importance를 낮게 매겨라.
 4. 카테고리별 관점:
 {hints}
 5. 한 이슈의 article_ids에는 대표 기사를 첫 번째로, 같은 사건의 다른 기사를 최대 2개까지 추가한다.
@@ -323,15 +367,18 @@ def select_clusters(client: Anthropic, articles, sent_log):
 - 파급 범위 (30%): 얼마나 많은 사람/산업에 영향을 주는가.
 - 독자 관련성 (20%): 광고회사 서비스 기획자의 업무·커리어와 얼마나 맞닿아 있는가.
 - 시의성 (10%): 지금 알아야 하는가, 나중에 알아도 되는가.
-- importance 5 미만인 이슈는 아예 목록에 넣지 않는다 (개수 미달이어도 무방).
+- importance 5 미만인 이슈는 넣지 않는다. 단 3번 규칙(분야별 최소 개수)이 우선이므로, 5점 이상이 없는 카테고리에서는 가장 나은 이슈를 실제 점수 그대로(낮게) 넣는다.
 
 ## 출력 형식
 아래 JSON만 출력한다. 다른 텍스트 금지.
 {{"clusters": [{{"category": "카테고리명", "headline": "이슈를 요약한 한 줄 제목", "article_ids": [대표id, ...], "importance": 1~10}}]}}"""
 
     data = _call_json(client, prompt, SELECT_SCHEMA)
-    clusters = sorted(data["clusters"], key=lambda c: -c.get("importance", 5))[:TOTAL_MAX]
-    print(f"[선별] {len(clusters)}개 이슈 선정")
+    clusters, counts, missing = _pick_balanced(data["clusters"])
+    dist = ", ".join(f"{cat} {n}" for cat, n in counts.items())
+    print(f"[선별] {len(clusters)}개 이슈 선정 ({dist})")
+    if missing:
+        print(f"[선별] 기사가 없어 채우지 못한 분야: {', '.join(missing)}")
     return clusters
 
 
