@@ -1,0 +1,56 @@
+# 이 파일은 GitHub 저장소에서 반드시 아래 경로/이름으로 만들어야 합니다:
+#   .github/workflows/daily-briefing.yml
+#
+# 매일 오전 9시(한국시간)에 뉴스 브리핑을 생성하고 카카오톡으로 발송합니다.
+
+name: daily-briefing
+
+on:
+  schedule:
+    - cron: "0 0 * * *"    # UTC 00:00 = 한국시간 오전 9:00 (매일 1회)
+  workflow_dispatch: {}      # Actions 탭에서 수동 실행 버튼 활성화 (테스트용)
+
+permissions:
+  contents: write
+
+jobs:
+  briefing:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 코드 가져오기
+        uses: actions/checkout@v4
+
+      - name: 파이썬 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 라이브러리 설치
+        run: pip install -r requirements.txt
+
+      - name: 브리핑 생성 및 발송
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
+          KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          PAGES_BASE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+        run: python news_bot.py
+
+      - name: 카카오 리프레시 토큰 자동 갱신 (필요할 때만)
+        if: hashFiles('new_refresh_token.txt') != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh secret set KAKAO_REFRESH_TOKEN --body "$(cat new_refresh_token.txt)" --repo ${{ github.repository }}
+          rm new_refresh_token.txt
+
+      - name: 브리핑 페이지 저장
+        run: |
+          git config user.name "briefing-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add docs/
+          git diff --cached --quiet || git commit -m "브리핑 $(date +'%Y-%m-%d')"
+          git push

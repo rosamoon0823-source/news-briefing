@@ -1,0 +1,14 @@
+# 카카오 앱 REST API 키 / 클라이언트 시크릿이 하드코딩되어 있음 — 절대 커밋 금지
+get_kakao_token.py
+
+# 카카오 리프레시 토큰 자동 갱신용 임시 파일 (워크플로가 생성 후 삭제)
+new_refresh_token.txt
+
+# 로컬 환경변수
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
