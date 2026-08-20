@@ -33,13 +33,15 @@ from anthropic import Anthropic
 from config import (
     SITE_TITLE, TOTAL_MAX, MAX_PER_CATEGORY, MIN_PER_CATEGORY, COLLECT_HOURS,
     CLAUDE_MODEL, CATEGORIES, CATEGORY_HINTS, NAVER_QUERIES,
-    MAX_KAKAO_MESSAGES,
+    KAKAO_CHAR_LIMIT, KAKAO_CAT_LABELS,
 )
 
 KST = datetime.timezone(datetime.timedelta(hours=9))
 NOW = datetime.datetime.now(KST)
 TODAY = NOW.strftime("%Y-%m-%d")
 TODAY_KR = NOW.strftime("%Y년 %m월 %d일") + " " + "월화수목금토일"[NOW.weekday()] + "요일"
+# 카톡 1통은 200자 제한이 빡빡해 연도를 뺀 짧은 날짜를 쓴다
+TODAY_KR_SHORT = NOW.strftime("%m월 %d일") + " " + "월화수목금토일"[NOW.weekday()] + "요일"
 
 # 하루 2회 실행 구분 (정오 이전 = 아침 브리핑, 이후 = 저녁 브리핑)
 IS_MORNING = NOW.hour < 12
@@ -433,7 +435,7 @@ def summarize(client: Anthropic, clusters):
 - summary: 이슈당 3~4문장. 사실 위주, 담백하고 명확하게. 본문에 없는 내용을 지어내지 않는다.
 - why: "그래서 이게 왜 중요한가"를 독자 관점에서 한 문장으로.
 - overview: 브리핑 맨 위에 들어갈 오늘의 흐름 요약 2~3문장.
-- kakao_lines: 카카오톡 알림용. 각 이슈마다 {{"cluster": 이슈번호, "line": "22자 이내 압축 제목"}} 형태로 전부 담는다.
+- kakao_lines: 카카오톡 알림용. 각 이슈마다 {{"cluster": 이슈번호, "line": "15자 이내 압축 제목"}} 형태로 전부 담는다. 카톡 1통(200자)에 8개 분야가 들어가야 하므로 15자를 넘기면 잘린다. 조사·수식어를 버리고 핵심 명사만 남겨라.
 - 영어 기사도 모두 한국어로 요약한다.
 
 ## 쉬운 언어 규칙 (모든 텍스트에 적용, 매우 중요)
@@ -647,7 +649,7 @@ def kakao_get_access_token():
 def kakao_send(access_token: str, text: str, url: str, button="브리핑 전체 보기"):
     template = {
         "object_type": "text",
-        "text": text[:200],
+        "text": text[:KAKAO_CHAR_LIMIT],
         "link": {"web_url": url, "mobile_web_url": url},
         "button_title": button,
     }
@@ -661,35 +663,61 @@ def kakao_send(access_token: str, text: str, url: str, button="브리핑 전체 
 
 
 def build_kakao_messages(kakao_lines, clusters, n):
-    """카카오 텍스트 200자 제한 대응: 필요 시 여러 건으로 분할한다.
-    분할 상한은 config.py의 MAX_KAKAO_MESSAGES.
-    중요도 내림차순으로 나열하고, 핵심(9점 이상) 이슈에는 🔴을 붙인다."""
-    entries = []
+    """분야별 대표 이슈 1건씩을 카톡 1통(200자)에 담는다.
+
+    카카오 텍스트 템플릿은 200자가 상한이어서 15건을 모두 담을 수 없다.
+    그래서 매일 같은 자리에서 같은 분야를 읽을 수 있도록 CATEGORIES 순서대로
+    분야별 1건씩만 싣고, 나머지는 브리핑 페이지로 넘긴다.
+
+    - 분야별 대표는 그 분야에서 중요도가 가장 높은 이슈.
+    - 중요도 표기 유지: 핵심(9점 이상)은 🔴, 그 외는 ·.
+    - 200자를 넘으면 헤드라인을 단계적으로 줄이고, 그래도 넘치면
+      중요도가 가장 낮은 분야를 뒤에서 뺀다 (발송 실패보다 낫다).
+    """
+    # 이슈번호 → 압축 헤드라인
+    lines = {}
     for item in kakao_lines:
         if isinstance(item, dict):
             ci, line = item.get("cluster", -1), str(item.get("line", "")).strip()
-        else:  # 모델이 문자열 배열로 응답한 경우의 안전장치
+        else:                       # 모델이 문자열 배열로 답한 경우의 안전장치
             ci, line = -1, str(item).strip()
-        if not line:
-            continue
-        imp = clusters[ci].get("importance", 5) if 0 <= ci < len(clusters) else 5
-        entries.append((imp, line))
-    entries.sort(key=lambda x: -x[0])
+        if line and 0 <= ci < len(clusters):
+            lines[ci] = line
 
-    header = f"{RUN_EMOJI} {TODAY_KR} {RUN_LABEL} 브리핑\n오늘의 이슈 {n}건\n\n"
-    messages, current = [], header
-    for imp, line in entries:
-        mark = "🔴 " if imp >= 9 else "· "
-        item = f"{mark}{line}\n"
-        if len(current) + len(item) > 195:
-            if len(messages) >= MAX_KAKAO_MESSAGES - 1:   # 상한 도달, 나머지는 버림
-                break
-            messages.append(current.rstrip())
-            current = item          # 이어지는 메시지는 머리말 없이 헤드라인부터
-        else:
-            current += item
-    messages.append(current.rstrip())
-    return messages[:MAX_KAKAO_MESSAGES]
+    # 분야별로 중요도가 가장 높은 이슈 하나만 남긴다
+    best = {}
+    for ci, line in lines.items():
+        c = clusters[ci]
+        cat, imp = c.get("category", "기타"), c.get("importance", 5)
+        if cat not in best or imp > best[cat][0]:
+            best[cat] = (imp, line)
+
+    order = [c for c in CATEGORIES if c in best] + [c for c in best if c not in CATEGORIES]
+    rows = [[cat, best[cat][0], best[cat][1]] for cat in order]
+
+    header = f"{RUN_EMOJI} {TODAY_KR_SHORT} 브리핑 · {n}건\n\n"
+
+    def clip(s, cut):
+        return s if not cut or len(s) <= cut else s[:cut - 1] + "…"
+
+    def render(cut):
+        out = header
+        for cat, imp, line in rows:
+            label = KAKAO_CAT_LABELS.get(cat, cat)
+            mark = "🔴 " if imp >= 9 else "· "
+            out += f"{label} {mark}{clip(line, cut)}\n"
+        return out.rstrip()
+
+    text = render(0)
+    for cut in (18, 16, 14, 12):            # 1) 헤드라인을 줄여 맞춘다
+        if len(text) <= KAKAO_CHAR_LIMIT:
+            break
+        text = render(cut)
+    while len(text) > KAKAO_CHAR_LIMIT and len(rows) > 1:   # 2) 약한 분야를 뺀다
+        rows.pop(min(range(len(rows)), key=lambda i: rows[i][1]))
+        text = render(12)
+
+    return [text]
 
 
 # ---------------------------------------------------------------------------
