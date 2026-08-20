@@ -33,6 +33,7 @@ from anthropic import Anthropic
 from config import (
     SITE_TITLE, TOTAL_MAX, MAX_PER_CATEGORY, COLLECT_HOURS,
     CLAUDE_MODEL, CATEGORIES, CATEGORY_HINTS, NAVER_QUERIES,
+    MAX_KAKAO_MESSAGES,
 )
 
 KST = datetime.timezone(datetime.timedelta(hours=9))
@@ -613,7 +614,8 @@ def kakao_send(access_token: str, text: str, url: str, button="브리핑 전체 
 
 
 def build_kakao_messages(kakao_lines, clusters, n):
-    """카카오 텍스트 200자 제한 대응: 필요 시 2개 메시지로 분할.
+    """카카오 텍스트 200자 제한 대응: 필요 시 여러 건으로 분할한다.
+    분할 상한은 config.py의 MAX_KAKAO_MESSAGES.
     중요도 내림차순으로 나열하고, 핵심(9점 이상) 이슈에는 🔴을 붙인다."""
     entries = []
     for item in kakao_lines:
@@ -633,14 +635,14 @@ def build_kakao_messages(kakao_lines, clusters, n):
         mark = "🔴 " if imp >= 9 else "· "
         item = f"{mark}{line}\n"
         if len(current) + len(item) > 195:
-            if len(messages) >= 1:      # 최대 2개까지만
+            if len(messages) >= MAX_KAKAO_MESSAGES - 1:   # 상한 도달, 나머지는 버림
                 break
             messages.append(current.rstrip())
-            current = "(이어서)\n" + item
+            current = item          # 이어지는 메시지는 머리말 없이 헤드라인부터
         else:
             current += item
     messages.append(current.rstrip())
-    return messages[:2]
+    return messages[:MAX_KAKAO_MESSAGES]
 
 
 # ---------------------------------------------------------------------------

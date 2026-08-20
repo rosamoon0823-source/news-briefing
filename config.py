@@ -11,6 +11,9 @@ SITE_TITLE = "모닝 브리핑"
 TOTAL_MAX = 15          # 하루 전체 최대 기사(이슈) 수
 MAX_PER_CATEGORY = 3    # 카테고리당 최대 이슈 수
 
+# 카카오톡 분할 발송 상한 (카톡 텍스트 200자 제한 때문에 여러 건으로 쪼개 보냄)
+MAX_KAKAO_MESSAGES = 3
+
 # 수집 대상 시간 범위 (시간 단위) - 최근 26시간 내 기사만 수집
 COLLECT_HOURS = 26
 
