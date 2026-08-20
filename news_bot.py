@@ -210,11 +210,90 @@ def _collect_naver(articles, seen):
 # 2) 선별 (Claude 1차 호출)
 # ---------------------------------------------------------------------------
 
-def _parse_json(text: str):
-    """모델 응답에서 JSON만 안전하게 추출"""
-    text = re.sub(r"```(json)?", "", text).strip()
-    start, end = text.find("{"), text.rfind("}")
-    return json.loads(text[start:end + 1])
+# 모델 응답 JSON 스키마.
+# output_config로 출력 형식을 강제하므로 모델이 형식을 어길 수 없다.
+SELECT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "clusters": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string"},
+                    "headline": {"type": "string"},
+                    "article_ids": {"type": "array", "items": {"type": "integer"}},
+                    "importance": {"type": "integer"},
+                },
+                "required": ["category", "headline", "article_ids", "importance"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["clusters"],
+    "additionalProperties": False,
+}
+
+SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "overview": {"type": "string"},
+        "kakao_lines": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "cluster": {"type": "integer"},
+                    "line": {"type": "string"},
+                },
+                "required": ["cluster", "line"],
+                "additionalProperties": False,
+            },
+        },
+        "sections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "cluster": {"type": "integer"},
+                    "headline": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "why": {"type": "string"},
+                },
+                "required": ["cluster", "headline", "summary", "why"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["overview", "kakao_lines", "sections"],
+    "additionalProperties": False,
+}
+
+# 응답 토큰 상한. 한국어는 토큰 소모가 커서 넉넉히 잡는다.
+# 상한일 뿐이므로 실제 생성한 토큰만 과금된다 (올려도 비용은 늘지 않는다).
+MAX_TOKENS = 16000
+
+
+def _call_json(client: Anthropic, prompt: str, schema: dict):
+    """Claude를 호출해 스키마에 맞는 JSON을 받아 dict로 반환한다.
+
+    - output_config로 형식을 강제하므로 응답은 항상 유효한 JSON이다.
+    - max_tokens에 걸려 잘린 경우는 조용히 넘기지 않고 즉시 실패시킨다.
+      (잘린 JSON을 그대로 파싱하면 원인을 알 수 없는 JSONDecodeError가 된다)
+    """
+    resp = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=MAX_TOKENS,
+        messages=[{"role": "user", "content": prompt}],
+        output_config={"format": {"type": "json_schema", "schema": schema}},
+    )
+    if resp.stop_reason == "max_tokens":
+        raise RuntimeError(
+            "모델 응답이 max_tokens(%d)에 걸려 잘렸습니다. "
+            "config.py의 TOTAL_MAX를 줄이거나 MAX_TOKENS를 올리세요." % MAX_TOKENS
+        )
+    text = next(b.text for b in resp.content if b.type == "text")
+    return json.loads(text)
 
 
 def select_clusters(client: Anthropic, articles, sent_log):
@@ -249,11 +328,7 @@ def select_clusters(client: Anthropic, articles, sent_log):
 아래 JSON만 출력한다. 다른 텍스트 금지.
 {{"clusters": [{{"category": "카테고리명", "headline": "이슈를 요약한 한 줄 제목", "article_ids": [대표id, ...], "importance": 1~10}}]}}"""
 
-    resp = client.messages.create(
-        model=CLAUDE_MODEL, max_tokens=4000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    data = _parse_json(resp.content[0].text)
+    data = _call_json(client, prompt, SELECT_SCHEMA)
     clusters = sorted(data["clusters"], key=lambda c: -c.get("importance", 5))[:TOTAL_MAX]
     print(f"[선별] {len(clusters)}개 이슈 선정")
     return clusters
@@ -327,11 +402,7 @@ def summarize(client: Anthropic, clusters):
 아래 JSON만 출력한다. 다른 텍스트 금지.
 {{"overview": "...", "kakao_lines": [{{"cluster": 이슈번호, "line": "..."}}], "sections": [{{"cluster": 이슈번호, "headline": "다듬은 제목", "summary": "...", "why": "..."}}]}}"""
 
-    resp = client.messages.create(
-        model=CLAUDE_MODEL, max_tokens=6000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    data = _parse_json(resp.content[0].text)
+    data = _call_json(client, prompt, SUMMARY_SCHEMA)
     print("[요약] 완료")
     return data
 
