@@ -21,6 +21,7 @@ import os
 import re
 import json
 import html
+import time
 import hashlib
 import datetime
 import traceback
@@ -33,7 +34,7 @@ from anthropic import Anthropic
 from config import (
     SITE_TITLE, TOTAL_MAX, MAX_PER_CATEGORY, MIN_PER_CATEGORY, COLLECT_HOURS,
     CLAUDE_MODEL, CATEGORIES, CATEGORY_HINTS, NAVER_QUERIES,
-    KAKAO_CHAR_LIMIT, KAKAO_CAT_LABELS,
+    KAKAO_CHAR_LIMIT, KAKAO_CAT_LABELS, KAKAO_CAT_EMOJI,
 )
 
 KST = datetime.timezone(datetime.timedelta(hours=9))
@@ -248,8 +249,9 @@ SUMMARY_SCHEMA = {
                 "properties": {
                     "cluster": {"type": "integer"},
                     "line": {"type": "string"},
+                    "desc": {"type": "string"},
                 },
-                "required": ["cluster", "line"],
+                "required": ["cluster", "line", "desc"],
                 "additionalProperties": False,
             },
         },
@@ -297,6 +299,12 @@ def _call_json(client: Anthropic, prompt: str, schema: dict):
         )
     text = next(b.text for b in resp.content if b.type == "text")
     return json.loads(text)
+
+
+def _cat_anchor(cat):
+    """브리핑 페이지의 분야 섹션 앵커 id (카톡 버튼이 바로 이동할 목적지)"""
+    cats = list(CATEGORIES)
+    return f"cat{cats.index(cat)}" if cat in cats else "cat-etc"
 
 
 def _pick_balanced(clusters):
@@ -435,7 +443,7 @@ def summarize(client: Anthropic, clusters):
 - summary: 이슈당 3~4문장. 사실 위주, 담백하고 명확하게. 본문에 없는 내용을 지어내지 않는다.
 - why: "그래서 이게 왜 중요한가"를 독자 관점에서 한 문장으로.
 - overview: 브리핑 맨 위에 들어갈 오늘의 흐름 요약 2~3문장.
-- kakao_lines: 카카오톡 알림용. 각 이슈마다 {{"cluster": 이슈번호, "line": "15자 이내 압축 제목"}} 형태로 전부 담는다. 카톡 1통(200자)에 8개 분야가 들어가야 하므로 15자를 넘기면 잘린다. 조사·수식어를 버리고 핵심 명사만 남겨라.
+- kakao_lines: 카카오톡 알림용. 각 이슈마다 {{"cluster": 이슈번호, "line": "22자 이내 압축 제목", "desc": "40자 이내 한 줄 설명"}} 형태로 전부 담는다. desc는 제목만으로 부족한 맥락(무슨 일이고 왜 의미 있는지)을 채우는 문장이며, 쉬운 언어 규칙을 그대로 적용한다. 제목을 반복하지 말 것.
 - 영어 기사도 모두 한국어로 요약한다.
 
 ## 쉬운 언어 규칙 (모든 텍스트에 적용, 매우 중요)
@@ -450,7 +458,7 @@ def summarize(client: Anthropic, clusters):
 
 ## 출력 형식
 아래 JSON만 출력한다. 다른 텍스트 금지.
-{{"overview": "...", "kakao_lines": [{{"cluster": 이슈번호, "line": "..."}}], "sections": [{{"cluster": 이슈번호, "headline": "다듬은 제목", "summary": "...", "why": "..."}}]}}"""
+{{"overview": "...", "kakao_lines": [{{"cluster": 이슈번호, "line": "...", "desc": "..."}}], "sections": [{{"cluster": 이슈번호, "headline": "다듬은 제목", "summary": "...", "why": "..."}}]}}"""
 
     data = _call_json(client, prompt, SUMMARY_SCHEMA)
     print("[요약] 완료")
@@ -570,7 +578,7 @@ def render_page(clusters, summary_data):
             if not s:
                 continue
             if not cat_rendered:
-                body_parts.append(f'<div class="cat-label">{html.escape(cat)}</div>')
+                body_parts.append(f'<div class="cat-label" id="{_cat_anchor(cat)}">{html.escape(cat)}</div>')
                 cat_rendered = True
             n += 1
             label, css = _imp_label(c.get("importance", 5))
@@ -662,62 +670,83 @@ def kakao_send(access_token: str, text: str, url: str, button="브리핑 전체 
     resp.raise_for_status()
 
 
-def build_kakao_messages(kakao_lines, clusters, n):
-    """분야별 대표 이슈 1건씩을 카톡 1통(200자)에 담는다.
+def build_kakao_messages(kakao_lines, clusters, collected_counts):
+    """분야별 카톡 메시지 목록을 만든다 — 8개 분야를 매일 빠짐없이 전달한다 (v1.2.4).
 
-    카카오 텍스트 템플릿은 200자가 상한이어서 15건을 모두 담을 수 없다.
-    그래서 매일 같은 자리에서 같은 분야를 읽을 수 있도록 CATEGORIES 순서대로
-    분야별 1건씩만 싣고, 나머지는 브리핑 페이지로 넘긴다.
-
-    - 분야별 대표는 그 분야에서 중요도가 가장 높은 이슈.
-    - 중요도 표기 유지: 핵심(9점 이상)은 🔴, 그 외는 ·.
-    - 200자를 넘으면 헤드라인을 단계적으로 줄이고, 그래도 넘치면
-      중요도가 가장 낮은 분야를 뒤에서 뺀다 (발송 실패보다 낫다).
+    - CATEGORIES 순서대로 분야당 1통 이상. 이슈가 0건인 분야도 생략하지 않고
+      "오늘은 이슈가 없다"는 통을 보낸다 (수집 0건 / 선별 탈락을 구분해 표기).
+    - 선별된 이슈는 하나도 빠짐없이 담는다. 각 이슈는
+      중요도 표시(🔴 9~10 / 🟠 7~8 / 🟡 5~6) + 제목(22자) + 한 줄 설명(40자).
+    - 한 분야가 200자를 넘으면 여러 통으로 이어 보낸다 (2통째 머리말 "(계속)").
+    - 반환: [(메시지 텍스트, 분야명)] — 분야명은 페이지 앵커 버튼 생성에 쓴다.
     """
-    # 이슈번호 → 압축 헤드라인
-    lines = {}
+    # 이슈번호 → (압축 제목, 한 줄 설명)
+    info = {}
     for item in kakao_lines:
         if isinstance(item, dict):
-            ci, line = item.get("cluster", -1), str(item.get("line", "")).strip()
+            ci = item.get("cluster", -1)
+            line = str(item.get("line", "")).strip()
+            desc = str(item.get("desc", "")).strip()
         else:                       # 모델이 문자열 배열로 답한 경우의 안전장치
-            ci, line = -1, str(item).strip()
+            ci, line, desc = -1, str(item).strip(), ""
         if line and 0 <= ci < len(clusters):
-            lines[ci] = line
+            info[ci] = (line, desc)
 
-    # 분야별로 중요도가 가장 높은 이슈 하나만 남긴다
-    best = {}
-    for ci, line in lines.items():
-        c = clusters[ci]
-        cat, imp = c.get("category", "기타"), c.get("importance", 5)
-        if cat not in best or imp > best[cat][0]:
-            best[cat] = (imp, line)
+    # 분야별 이슈 목록 (중요도 내림차순)
+    by_cat = {}
+    for ci, c in enumerate(clusters):
+        by_cat.setdefault(c.get("category", "기타"), []).append(ci)
+    for lst in by_cat.values():
+        lst.sort(key=lambda ci: -clusters[ci].get("importance", 5))
 
-    order = [c for c in CATEGORIES if c in best] + [c for c in best if c not in CATEGORIES]
-    rows = [[cat, best[cat][0], best[cat][1]] for cat in order]
+    order = list(CATEGORIES) + [c for c in by_cat if c not in CATEGORIES]
 
-    header = f"{RUN_EMOJI} {TODAY_KR_SHORT} 브리핑 · {n}건\n\n"
+    def mark(imp):
+        return "🔴" if imp >= 9 else ("🟠" if imp >= 7 else "🟡")
 
-    def clip(s, cut):
-        return s if not cut or len(s) <= cut else s[:cut - 1] + "…"
+    def clip(t, cut):
+        return t if len(t) <= cut else t[:cut - 1] + "…"
 
-    def render(cut):
-        out = header
-        for cat, imp, line in rows:
-            label = KAKAO_CAT_LABELS.get(cat, cat)
-            mark = "🔴 " if imp >= 9 else "· "
-            out += f"{label} {mark}{clip(line, cut)}\n"
-        return out.rstrip()
+    messages = []
+    for cat in order:
+        emoji = KAKAO_CAT_EMOJI.get(cat, "📌")
+        idxs = by_cat.get(cat, [])
 
-    text = render(0)
-    for cut in (18, 16, 14, 12):            # 1) 헤드라인을 줄여 맞춘다
-        if len(text) <= KAKAO_CHAR_LIMIT:
-            break
-        text = render(cut)
-    while len(text) > KAKAO_CHAR_LIMIT and len(rows) > 1:   # 2) 약한 분야를 뺀다
-        rows.pop(min(range(len(rows)), key=lambda i: rows[i][1]))
-        text = render(12)
+        if not idxs:                              # 0건 분야도 반드시 알린다
+            collected = collected_counts.get(cat, 0)
+            if collected == 0:
+                reason = "오늘은 수집된 새 기사가 없었어요."
+            else:
+                reason = f"새 기사 {collected}건을 살펴봤지만 굵직한 이슈는 없었어요."
+            messages.append((f"{emoji} {cat}\n{reason}", cat))
+            continue
 
-    return [text]
+        header = f"{emoji} {cat} (오늘 {len(idxs)}건)\n"
+        cont_header = f"{emoji} {cat} (계속)\n"
+        cur = header
+
+        for ci in idxs:
+            imp = clusters[ci].get("importance", 5)
+            line, desc = info.get(ci, (clusters[ci].get("headline", ""), ""))
+            line = clip(line, 22)
+            desc = clip(desc, 40)
+            block = f"\n{mark(imp)} {line}\n" + (f"→ {desc}\n" if desc else "")
+
+            if len(cur) + len(block) > KAKAO_CHAR_LIMIT:
+                if desc:                          # 1) 설명을 줄여서 끼워본다
+                    for cut in (32, 26, 20):
+                        b2 = f"\n{mark(imp)} {line}\n→ {clip(desc, cut)}\n"
+                        if len(cur) + len(b2) <= KAKAO_CHAR_LIMIT:
+                            block = b2
+                            break
+                if len(cur) + len(block) > KAKAO_CHAR_LIMIT:   # 2) 통을 나눈다
+                    messages.append((cur.rstrip(), cat))
+                    cur = cont_header
+            cur += block
+
+        messages.append((cur.rstrip(), cat))
+
+    return messages
 
 
 # ---------------------------------------------------------------------------
@@ -739,17 +768,32 @@ def main():
     n = render_page(clusters, summary_data)
     save_sent_log(sent_log, [c["headline"] for c in clusters])
 
+    # 분야별 수집량 (0건 분야의 사유 표기용: 수집 자체가 없었는지, 선별에서 걸러졌는지)
+    collected_counts = {}
+    for a in articles:
+        collected_counts[a["category"]] = collected_counts.get(a["category"], 0) + 1
+
     page_url = f"{base_url}/{TODAY}-{RUN_SLUG}.html" if base_url else "https://github.com"
     try:
         token = kakao_get_access_token()
-        msgs = build_kakao_messages(summary_data.get("kakao_lines", []), clusters, n)
-        for i, m in enumerate(msgs):
-            kakao_send(token, m, page_url,
-                       button="브리핑 전체 보기" if i == 0 else "브리핑 열기")
-        print(f"[발송] 카카오톡 {len(msgs)}건 전송 완료")
     except Exception:
-        print("[경고] 카카오톡 발송 실패 — 브리핑 페이지는 정상 발행되었습니다.")
+        print("[경고] 카카오 토큰 갱신 실패 — 브리핑 페이지는 정상 발행되었습니다.")
         traceback.print_exc()
+        return
+
+    msgs = build_kakao_messages(summary_data.get("kakao_lines", []), clusters, collected_counts)
+    sent = 0
+    for text, cat in msgs:
+        url = f"{page_url}#{_cat_anchor(cat)}"
+        try:
+            kakao_send(token, text[:KAKAO_CHAR_LIMIT], url, button="자세히 보기")
+            sent += 1
+            print(f"[발송] {cat} 통 전송  ({len(text)}자)")
+        except Exception:
+            print(f"[경고] '{cat}' 통 발송 실패 — 나머지 통은 계속 발송합니다.")
+            traceback.print_exc()
+        time.sleep(1)                 # 통 순서가 섞이지 않도록 간격을 둔다
+    print(f"[발송] 카카오톡 {sent}/{len(msgs)}통 전송 완료")
 
 
 if __name__ == "__main__":
