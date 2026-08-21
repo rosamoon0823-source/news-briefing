@@ -7,7 +7,7 @@ name: daily-briefing
 
 on:
   schedule:
-    - cron: "0 0 * * *"    # UTC 00:00 = 한국시간 오전 9:00 (매일 1회)
+    - cron: "47 23 * * *"    # UTC 00:00 = 한국시간 오전 9:00 (매일 1회) > 발송실패. 혼잡시간 피한 8시47분으로 수정
   workflow_dispatch: {}      # Actions 탭에서 수동 실행 버튼 활성화 (테스트용)
 
 permissions:
